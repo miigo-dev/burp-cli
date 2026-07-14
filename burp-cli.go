@@ -16,6 +16,7 @@ import (
 
 	"burp-cli/modules/commander"
 	"burp-cli/modules/configure"
+	"burp-cli/modules/job"
 	"burp-cli/modules/nmap"
 	"burp-cli/modules/reporter"
 	"burp-cli/modules/scanner"
@@ -63,6 +64,12 @@ var reportInput, reportOutput, reportFormat string
 // v1.2.1: Added scan listing and bulk export features
 var listScans, listAndExportAll, importFromBurp bool
 var clearOldScans int
+// v1.2.2: Added job-driven execution for automation pipelines
+var jobFile string
+
+// DeepScanConfigName is the Burp scan configuration name always applied to
+// job-driven runs (see runJob), regardless of anything in the job file.
+const DeepScanConfigName = "Crawl and Audit - Deep"
 
 func init() {
 	flaggy.SetName("burp-cli")
@@ -175,7 +182,10 @@ Version Info: burp-cli -V  or  burp-cli --version
 	flaggy.Bool(&listAndExportAll, "LA", "list-and-export-all", "List all scans and export HTML reports for each")
 	flaggy.Bool(&importFromBurp, "", "import-from-burp", "Import existing scans from Burp API (scans ID 1-50)")
 	flaggy.Int(&clearOldScans, "", "clear-old-scans", "Clear scan records older than specified days (e.g., --clear-old-scans 30)")
-	
+
+	// v1.2.2: Job-driven execution for automation pipelines (e.g. Google Forms/Sheets intake)
+	flaggy.String(&jobFile, "j", "job", "Path to a job spec JSON file for automated pipeline execution (forces deep scan + auto-export)")
+
 	// Hidden flag for adding test scans
 	flaggy.String(&addTestScan, "", "add-test-scan", "Add a test scan to history (format: scanID,url)")
 	
@@ -277,14 +287,21 @@ func createExportDir() string {
 
 // Monitor scan and export when complete
 func monitorAndExport(target, port, scanID, scanURL, exportDir, apikey string) {
+	monitorAndExportStatus(target, port, scanID, scanURL, exportDir, apikey)
+}
+
+// monitorAndExportStatus polls a scan until it completes, exports results on
+// success, and returns the final status ("succeeded"/"failed") so callers
+// can decide how to react (e.g. a process exit code).
+func monitorAndExportStatus(target, port, scanID, scanURL, exportDir, apikey string) (string, error) {
 	fmt.Fprintf(color.Output, "%v Monitoring scan %v...\n", cyan(" [i] INFO:"), scanID)
-	
+
 	// Track this scan
 	tracker, err := scanner.NewScanTracker()
 	if err == nil {
 		tracker.AddScan(scanID, scanURL, "", "")
 	}
-	
+
 	for {
 		status, err := configure.CheckScanStatus(target, port, scanID, apikey)
 		if err != nil {
@@ -292,32 +309,114 @@ func monitorAndExport(target, port, scanID, scanURL, exportDir, apikey string) {
 			if tracker != nil {
 				tracker.UpdateScanStatus(scanID, "failed")
 			}
-			return
+			return "failed", err
 		}
-		
+
 		fmt.Fprintf(color.Output, "%v Scan status: %v\n", cyan(" [i] INFO:"), status)
-		
+
 		// Update scan status in tracker
 		if tracker != nil {
 			tracker.UpdateScanStatus(scanID, status)
 		}
-		
+
 		if status == "succeeded" || status == "failed" {
 			fmt.Fprintf(color.Output, "%v Scan completed with status: %v\n", green(" [+] SUCCESS:"), status)
-			
+
 			if status == "succeeded" && exportDir != "" {
 				filename := generateFilename(scanURL)
 				jsonFilePath := exportDir + "/" + filename
 				commander.GetScanWithFilename(target, port, scanID, exportDir, filename, apikey)
-				
+
 				// v1.2.0: Automatically generate HTML report from JSON export
 				generateHTMLReportFromJSON(jsonFilePath, scanURL, exportDir)
 			}
-			break
+			return status, nil
 		}
-		
+
 		time.Sleep(10 * time.Second)
 	}
+}
+
+// sanitizeForPath converts a string into a safe path component (used for
+// namespacing job-driven export directories per client).
+func sanitizeForPath(name string) string {
+	if name == "" {
+		return "job"
+	}
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// createJobExportDir creates a client-namespaced export directory for a
+// job-driven run, so repeated unattended pipeline runs against different
+// clients don't collide in a shared burp-export folder.
+func createJobExportDir(clientName string) string {
+	dirName := fmt.Sprintf("burp-export/%s_%s", sanitizeForPath(clientName), time.Now().Format("20060102_150405"))
+
+	if err := os.MkdirAll(dirName, 0755); err != nil {
+		fmt.Fprintf(color.Output, "%v Failed to create export directory: %v\n", red(" [-] ERROR:"), err)
+		return ""
+	}
+	fmt.Fprintf(color.Output, "%v Created export directory: %v\n", green(" [+] SUCCESS:"), dirName)
+	return dirName
+}
+
+// runJob executes a single job-driven scan (see modules/job.Spec) for
+// automation pipelines: it always forces DeepScanConfigName, always exports
+// results, and returns a process exit code the caller can trust.
+func runJob(jobFile string) int {
+	spec, err := job.Load(jobFile)
+	if err != nil {
+		fmt.Fprintf(color.Output, "%v %v\n", red(" [-] ERROR:"), err)
+		return 1
+	}
+
+	if !configure.CheckBurp(target, port, key) {
+		fmt.Fprintf(color.Output, "%v No Burp API endpoint found on %v.\n", red(" [-] ERROR:"), target+":"+port)
+		return 1
+	}
+	fmt.Fprintf(color.Output, "%v Found Burp API endpoint on %v.\n", green(" [+] SUCCESS:"), target+":"+port)
+
+	exportDir := createJobExportDir(spec.ClientName)
+	if exportDir == "" {
+		return 1
+	}
+
+	Location := configure.ScanConfigAdvanced(
+		target, port, spec.TargetURL, spec.Username, spec.Password, key,
+		DeepScanConfigName, spec.ScopeInclude, spec.ScopeExclude, spec.ProtocolOption,
+		"", "", 0,
+		// scanName intentionally left empty: Burp Suite Professional (desktop)
+		// rejects the "name" field with a 400 ("Enterprise-only feature") —
+		// confirmed against a live Pro instance. ClientName is used only for
+		// local export-directory naming (createJobExportDir), never sent to Burp.
+		"", spec.ResourcePool, spec.CallbackURL,
+		spec.AdvancedScope, spec.RecordedLoginScript,
+	)
+	if Location == "" {
+		fmt.Fprintf(color.Output, "%v Can't start scan.\n", red(" [-] ERROR:"))
+		return 1
+	}
+
+	scanID := extractScanID(Location)
+	fmt.Fprintf(color.Output, "%v Scanning %v with ID %v.\n", green(" [+] SUCCESS:"), spec.TargetURL, scanID)
+
+	status, err := monitorAndExportStatus(target, port, scanID, spec.TargetURL, exportDir, key)
+	if err != nil || status != "succeeded" {
+		fmt.Fprintf(color.Output, "%v Job scan finished with status %q\n", red(" [-] ERROR:"), status)
+		return 1
+	}
+
+	fmt.Fprintf(color.Output, "%v Job completed successfully. Report available in %v\n", green(" [+] SUCCESS:"), exportDir)
+	return 0
 }
 
 func main() {
@@ -360,8 +459,15 @@ func main() {
 		os.Exit(0)
 	}
 
+	// v1.2.2: Job-driven execution for automation pipelines (mutually exclusive with -s/-sl/-sn)
+	if jobFile != "" {
+		if scan != "" || scanList != "" || nmapScan != "" {
+			fmt.Fprintf(color.Output, "%v --job cannot be combined with -s/-sl/-sn\n", red(" [-] ERROR:"))
+			os.Exit(1)
+		}
+		os.Exit(runJob(jobFile))
+	}
 
-	
 	// v1.2.1: Handle scan listing and management
 	if listScans || listAndExportAll || clearOldScans > 0 || addTestScan != "" || importFromBurp {
 		handleScanManagement()
@@ -372,7 +478,7 @@ func main() {
 		fmt.Fprintf(color.Output, "%v Found Burp API endpoint on %v.\n", green(" [+] SUCCESS:"), target+":"+port)
 	} else {
 		fmt.Fprintf(color.Output, "%v No Burp API endpoint found on %v.\n", red(" [-] ERROR:"), target+":"+port)
-		os.Exit(0)
+		os.Exit(1)
 	}
 
 	// v1.1.7: Smart export directory management
@@ -425,10 +531,10 @@ func main() {
 				}
 			} else {
 				fmt.Fprintf(color.Output, "%v Can't start scan .\n", red(" [-] ERROR:"))
-				os.Exit(0)
+				os.Exit(1)
 			}
 		}
-		
+
 		// Wait for all scans to complete if auto-export is enabled
 		if autoExport {
 			fmt.Fprintf(color.Output, "%v Waiting for all scans to complete...\n", cyan(" [i] INFO:"))
@@ -494,7 +600,7 @@ func main() {
 			}
 		} else {
 			fmt.Fprintf(color.Output, "%v Can't start scan .\n", red(" [-] ERROR:"))
-			os.Exit(0)
+			os.Exit(1)
 		}
 	}
 
